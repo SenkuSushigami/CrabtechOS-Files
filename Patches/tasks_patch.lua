@@ -7,31 +7,46 @@
 --  Set up
 --    1. Put a modem on this computer and on each worker computer.
 --       (Wired modems must be right-clicked so they connect to the network.)
---    2. On each worker:   worker key <secret>     then     worker
---                         (worker install  starts it automatically at boot)
---    3. In the OS:  TASKS tab -> K -> type the SAME secret.
---    4. Press S to scan. Workers that answer show up under COMPUTERS.
+--    2. On each worker computer run:   worker key <secret>    then   worker
+--       (worker install  makes it start automatically at boot)
+--    3. In the OS open the TASKS tab, press K and type the SAME secret.
+--       Press S to scan - workers that answer show up under COMPUTERS.
 --
 --  Using it
 --    COMPUTERS   ANY idle computer   picks the least busy worker for you
 --                ALL computers       runs the task on every worker
 --                #12 label ...      one specific computer
---      Enter  run a command there        F  send a task file
+--      Enter  run a command there        F  run an app from GitHub there
 --      S      scan again                 K  set the shared key
 --    TASKS (Tab switches pane)
 --      Enter  show the output            X  cancel a running task
 --      C      clear finished tasks       R  refresh now
 --    Touch: tap a row to select it, tap again to use it.
 --
---  Task files are ordinary Lua programs kept in a folder named  tasks  on
---  this computer (or /disk/tasks on a floppy). They run on the worker with
---  the arguments you type.
+--  Files from GitHub: F asks the repo
+--  (github.com/SenkuSushigami/CrabtechOS-Files) for the .lua files in its
+--  apps/ folder - the same folder the APP STORE uses. The WORKER then
+--  downloads the file you picked straight from GitHub and runs it with the
+--  arguments you type, so nothing big travels over the modem network and
+--  every worker needs the HTTP API enabled. If this computer cannot reach
+--  GitHub, the picker falls back to the apps folders on this computer and
+--  floppies, and those files are sent to the worker as code instead.
+--  (An app that starts itself when run from a shell, like ae2Dashboard,
+--  keeps running on the worker until you cancel it or it hits the worker's
+--  10 minute limit.)
+--
+--  Autocomplete
+--    Command prompt   Tab completes program names and earlier commands;
+--                     Up/Down browse your command history.
+--    File picker      just type to filter the list; Tab completes the name;
+--                     Backspace erases, and goes back when the box is empty.
 --
 --  Security: messages are signed with the shared key (HMAC-SHA256) and carry
 --  a timestamp, so computers without the key, replays and edited messages
 --  are ignored. Anyone WITH the key can run code on every worker.
 --
 --  Works on the merged OS file (crabtech). The tab is added above INSTALLED.
+--  Running it on an OS that already has an older TASKS tab upgrades it.
 --
 -- Usage:  tasks_patch            (patches "crabtech")
 --         tasks_patch myfile     (patches another file name)
@@ -50,7 +65,11 @@ local f = fs.open(path, "r")
 local src = f.readAll()
 f.close()
 
-if src:find("-- tasks tab (offload)", 1, true) then
+local hasNew = src:find("-- tasks v3: signed messages", 1, true) ~= nil
+local hasOld = src:find("-- tasks tab (offload)", 1, true) ~= nil
+local hasChar = src:find('onEvent("char"', 1, true) ~= nil
+
+if hasNew and hasChar then
   print("Already patched - nothing to do.")
   return
 end
@@ -60,6 +79,7 @@ if not (src:find("local function actInstalled", 1, true) and src:find("local fun
 end
 
 local BLOCK = [==[-- tasks tab (offload)
+-- tasks v3: signed messages, workers pull from github, autocomplete
 local actTasks
 do
 -- CORE BEGIN
@@ -235,6 +255,62 @@ local function tkRpc(targets, payload, timeout)
   return replies
 end
 
+-- task files come from the GitHub repo's apps folder
+local tkRepo = { repo = "SenkuSushigami/CrabtechOS-Files", branch = "main", dir = "apps" }
+
+local function tkGet(url, headers)
+  if not http then return nil, "the HTTP API is disabled" end
+  local res, err, failed = http.get(url, headers)
+  if not res then
+    local code = failed and failed.getResponseCode and failed.getResponseCode()
+    if failed and failed.close then failed.close() end
+    return nil, (code and ("HTTP " .. code .. " ") or "") .. tostring(err or "request failed")
+  end
+  local body = res.readAll()
+  res.close()
+  return body
+end
+
+-- the .lua files in the repo's apps folder: { name, file, size, remote = true }
+local function tkRemoteList()
+  local api = "https://api.github.com/repos/" .. tkRepo.repo .. "/contents/" .. tkRepo.dir
+    .. "?ref=" .. tkRepo.branch
+  local body, err = tkGet(api, { Accept = "application/vnd.github+json" })
+  if not body then return nil, err end
+  local data = textutils.unserializeJSON(body)
+  if type(data) ~= "table" then return nil, "unexpected reply from GitHub" end
+  if data.message then return nil, tostring(data.message) end
+  local out = {}
+  for _, e in ipairs(data) do
+    if e.type == "file" and type(e.name) == "string" and e.name:match("%.lua$") then
+      out[#out + 1] = { name = (e.name:gsub("%.lua$", "")), file = e.name, size = e.size or 0, remote = true }
+    end
+  end
+  table.sort(out, function(a, b) return a.name:lower() < b.name:lower() end)
+  return out
+end
+
+-- fallback when GitHub cannot be reached: the apps folders on this computer and floppies
+local function tkLocalList()
+  local out = {}
+  local function scan(dir, tag)
+    if fs.isDir(dir) then
+      for _, f in ipairs(fs.list(dir)) do
+        local p = fs.combine(dir, f)
+        if not fs.isDir(p) and f:match("%.lua$") then
+          out[#out + 1] = { name = (f:gsub("%.lua$", "")), file = f, path = p, tag = tag }
+        end
+      end
+    end
+  end
+  scan("apps", "")
+  for _, d in ipairs(fs.list("/")) do
+    if d:match("^disk") and fs.isDir(d) then scan(fs.combine(d, "apps"), "  [" .. d .. "]") end
+  end
+  table.sort(out, function(a, b) return a.name:lower() < b.name:lower() end)
+  return out
+end
+
 -- the list of known computers and submitted tasks is kept in a small file
 local function tkLoad()
   local s = tkReadFile(tkDbFile)
@@ -243,11 +319,13 @@ local function tkLoad()
   db.workers = type(db.workers) == "table" and db.workers or {}
   db.tasks = type(db.tasks) == "table" and db.tasks or {}
   db.rr = db.rr or 0
+  db.history = type(db.history) == "table" and db.history or {}
   return db
 end
 
 local function tkSave(db)
   while #db.tasks > 40 do table.remove(db.tasks, 1) end
+  while #db.history > 30 do table.remove(db.history, 1) end
   tkWriteFile(tkDbFile, textutils.serialize(db))
 end
 
@@ -306,7 +384,7 @@ local function tkSubmit(db, ids, spec)
   for _, id in ipairs(ids) do
     local task = {
       id = "t" .. os.epoch("utc") .. "-" .. math.random(1000, 9999),
-      name = spec.name, kind = spec.kind, cmd = spec.cmd, code = spec.code, args = spec.args or {},
+      name = spec.name, kind = spec.kind, cmd = spec.cmd, code = spec.code, file = spec.file, args = spec.args or {},
     }
     local r = tkRpc({ id }, { t = "run", task = task }, 2)[id]
     local rec = { id = task.id, name = spec.name, worker = id, kind = spec.kind, t0 = os.epoch("utc"), state = "queued" }
@@ -409,13 +487,13 @@ actTasks = function()
   end
 
   -- text input on the computer's own keyboard
-  local function ask(title, prompt, secret)
+  local function ask(title, prompt, secret, history, complete)
     local answer
     local function run()
       print(title)
       print()
       write(prompt .. " ")
-      answer = read(secret and "*" or nil)
+      answer = read(secret and "*" or nil, history, complete)
     end
     if runStyled then
       runStyled({
@@ -430,54 +508,117 @@ actTasks = function()
     return answer
   end
 
-  -- task files: /tasks and /disk*/tasks
-  local function taskFiles()
-    local out = {}
-    local function scan(dir, tag)
-      if fs.isDir(dir) then
-        for _, f in ipairs(fs.list(dir)) do
-          local p = fs.combine(dir, f)
-          if not fs.isDir(p) and f:match("%.lua$") then
-            out[#out + 1] = { name = (f:gsub("%.lua$", "")), path = p, tag = tag }
-          end
-        end
-      end
+  -- Tab completion for the command prompt: earlier commands + programs from this computer's shell
+  local function complete(line)
+    local out, seen = {}, {}
+    local function add(s)
+      if type(s) == "string" and s ~= "" and not seen[s] then seen[s] = true out[#out + 1] = s end
     end
-    scan("tasks", "")
-    for _, d in ipairs(fs.list("/")) do
-      if d:match("^disk") and fs.isDir(d) then scan(fs.combine(d, "tasks"), "  [" .. d .. "]") end
+    for i = #db.history, 1, -1 do
+      local h = db.history[i]
+      if #h > #line and h:sub(1, #line) == line then add(h:sub(#line + 1)) end
     end
-    table.sort(out, function(a, b) return a.name < b.name end)
+    if shell and shell.complete then
+      local ok, list = pcall(shell.complete, line)
+      if ok and type(list) == "table" then for _, s in ipairs(list) do add(s) end end
+    end
     return out
   end
 
+  -- tasks files: the repo's apps folder on GitHub, with type-to-filter and Tab completion
+  local function commonPrefix(list)
+    if #list == 0 then return "" end
+    local p = list[1].name
+    for i = 2, #list do
+      local n, j = list[i].name, 0
+      while j < #p and j < #n and p:sub(j + 1, j + 1):lower() == n:sub(j + 1, j + 1):lower() do j = j + 1 end
+      p = p:sub(1, j)
+    end
+    return p
+  end
+
   local function pickTaskFile()
-    local files = taskFiles()
-    local chosen, psel, ptop = nil, 1, 1
-    page("TASK FILES", function(x1, y1, x2, y2)
-      put(x1, y1, "Lua files in /tasks (and /disk*/tasks) - enter sends one", grey, pale)
-      if #files == 0 then
-        put(x1, y1 + 2, "No task files yet - put .lua programs in a folder named tasks", mid, pale)
-        return
+    flash("asking GitHub for the apps folder ...")
+    local files, err = tkRemoteList()
+    local source = "GitHub  " .. tkRepo.repo .. "/" .. tkRepo.dir
+    if not files then
+      files = tkLocalList()
+      source = "this computer's apps folders  (GitHub: " .. tostring(err) .. ")"
+    end
+    local query, psel, ptop = "", 1, 1
+    local chosen, parea = nil, {}
+
+    local function matches()
+      local q, out = query:lower(), {}
+      for _, f in ipairs(files) do
+        if q == "" or f.name:lower():find(q, 1, true) then out[#out + 1] = f end
       end
-      local rows = math.max(1, y2 - (y1 + 2))
+      return out
+    end
+
+    page("TASK FILES", function(x1, y1, x2, y2)
+      local w = x2 - x1 + 1
+      put(x1, y1, ("from " .. source):sub(1, w), grey, pale)
+      fill(x1, y1 + 1, x2, y1 + 1, lav)
+      put(x1 + 1, y1 + 1, ("find: " .. query .. "_"):sub(1, math.max(1, w - 2)), deep, lav)
+      local list = matches()
+      if #files == 0 then
+        put(x1, y1 + 3, "No .lua files found in the apps folder.", mid, pale)
+      elseif #list == 0 then
+        put(x1, y1 + 3, ("Nothing matches '" .. query .. "'"):sub(1, w), pink, pale)
+      end
+      psel = clamp(psel, 1, math.max(1, #list))
+      local rows = math.max(1, y2 - 1 - (y1 + 3))
+      parea = { y0 = y1 + 3, rows = rows }
       if psel < ptop then ptop = psel end
       if psel > ptop + rows - 1 then ptop = psel - rows + 1 end
       for i = 0, rows - 1 do
-        local f = files[ptop + i]
+        local f = list[ptop + i]
         if not f then break end
         local on = (ptop + i == psel)
         local bg = on and deep or pale
-        fill(x1, y1 + 2 + i, x2, y1 + 2 + i, bg)
-        put(x1 + 1, y1 + 2 + i, ((on and "\16 " or "  ") .. f.name .. f.tag):sub(1, x2 - x1 - 1), on and snow or deep, bg)
+        local y = y1 + 3 + i
+        fill(x1, y, x2, y, bg)
+        put(x1 + 1, y, ((on and "\16 " or "  ") .. f.name .. (f.tag or "")):sub(1, math.max(1, w - 12)), on and snow or deep, bg)
+        if f.size then put(x2 - 8, y, string.format("%.1f kB", f.size / 1024), on and ice or grey, bg) end
       end
-    end, function(kind, a)
-      if kind ~= "key" then return end
-      if a == keys.up and psel > 1 then psel = psel - 1 return "render" end
-      if a == keys.down and psel < #files then psel = psel + 1 return "render" end
-      if a == keys.enter then
-        chosen = files[psel]
-        return "close"
+      put(x1, y2, ("type to filter   tab complete   enter send   backspace erase"):sub(1, w), grey, pale)
+    end, function(kind, a, b)
+      local list = matches()
+      if kind == "char" then
+        query, psel, ptop = query .. a, 1, 1
+        return "render"
+      elseif kind == "key" then
+        if a == keys.up then psel = math.max(1, psel - 1) return "render"
+        elseif a == keys.down then psel = math.min(math.max(1, #list), psel + 1) return "render"
+        elseif a == keys.tab then
+          if #list == 1 then query = list[1].name
+          elseif #list > 1 then
+            local p = commonPrefix(list)
+            if #p > #query then query = p end
+          end
+          psel, ptop = 1, 1
+          return "render"
+        elseif a == keys.enter then
+          chosen = list[psel]
+          if chosen then return "close" end
+          return "render"
+        elseif a == keys.backspace then
+          if #query > 0 then query, psel, ptop = query:sub(1, -2), 1, 1 return "render" end
+          return nil                       -- empty search: Backspace goes back
+        elseif a == keys.delete then
+          query, psel, ptop = "", 1, 1
+          return "render"
+        elseif a == keys.q then
+          return "render"                  -- Q is a letter here, not "back"
+        end
+      elseif kind == "click" and parea.y0 and b >= parea.y0 and b < parea.y0 + parea.rows then
+        local idx = ptop + (b - parea.y0)
+        if list[idx] then
+          if idx == psel then chosen = list[idx] return "close" end
+          psel = idx
+          return "render"
+        end
       end
     end)
     return chosen
@@ -520,7 +661,8 @@ actTasks = function()
     if needKey() then return end
     local ids, label = selectedTargets()
     if not ids then say(label, pink) return end
-    local cmd = ask("Run a command on " .. label, "Command:")
+    local cmd = ask("Run a command on " .. label, "Command:", false, db.history, complete)
+    tkSave(db)                                     -- keeps the command history
     if cmd then send(ids, { name = cmd:sub(1, 40), kind = "cmd", cmd = cmd }, label) end
   end
 
@@ -530,13 +672,24 @@ actTasks = function()
     if not ids then say(label, pink) return end
     local file = pickTaskFile()
     if not file then return end
-    local code = tkReadFile(file.path)
-    if not code then say("could not read " .. file.path, pink) return end
-    if #code > 100000 then say(file.name .. " is too big to send (100 kB max)", pink) return end
-    local argText = ask("Send " .. file.name .. " to " .. label, "Arguments (optional):")
+    local spec
+    local argText
+    if file.remote then
+      argText = ask("Run " .. file.name .. " on " .. label .. "  (the computer downloads it from GitHub)", "Arguments (optional):")
+      spec = { name = file.name, kind = "github", file = file.file }
+    else
+      local code = tkReadFile(file.path)
+      if not code then say("could not read " .. file.path, pink) return end
+      if #code > 100000 then say(file.name .. " is too big to send (100 kB max)", pink) return end
+      local fn, perr = load(code, "=" .. file.name)
+      if not fn then say(file.name .. " is not valid Lua: " .. tostring(perr), pink) return end
+      argText = ask("Send " .. file.name .. " to " .. label, "Arguments (optional):")
+      spec = { name = file.name, kind = "lua", code = code }
+    end
     local list = {}
     for word in (argText or ""):gmatch("%S+") do list[#list + 1] = word end
-    send(ids, { name = file.name, kind = "lua", code = code, args = list }, label)
+    spec.args = list
+    send(ids, spec, label)
   end
 
   local function setKey()
@@ -684,7 +837,7 @@ actTasks = function()
 
     put(x1, y2 - 1, status:sub(1, w), statusColor, pale)
     local hint = (focus == "c")
-      and "enter run   f task file   s scan   k key   tab tasks"
+      and "enter run   f file from GitHub   s scan   k key   tab tasks"
       or "enter output   x cancel   c clear   r refresh   tab computers"
     put(x1, y2, hint:sub(1, w), grey, pale)
   end
@@ -761,9 +914,7 @@ actTasks = function()
     end
   end)
 end
-end
-
-local actions = {]==]
+end]==]
 
 local ok = true
 local function plainEdit(label, old, new)
@@ -773,12 +924,22 @@ local function plainEdit(label, old, new)
   print("patched : " .. label)
 end
 
-plainEdit("Menu button", '{ label = "INSTALLED" }', '{ label = "TASKS" }, { label = "INSTALLED" }')
-plainEdit("Tasks tab", "local actions = {", BLOCK)
-plainEdit("Button action", "actInstalled, actCredits }", "actTasks, actInstalled, actCredits }")
-
--- list this patch on the INSTALLED tab (optional)
-do
+if hasOld then
+  -- an older TASKS tab is installed: replace it with this version
+  local a = src:find("-- tasks tab (offload)", 1, true)
+  local s2 = src:find("\nend\n\nlocal actions = {", a, true)
+  if s2 then
+    src = src:sub(1, a - 1) .. BLOCK .. src:sub(s2 + 4)
+    print("patched : Tasks tab upgraded")
+  else
+    print("skipped : Tasks tab upgrade (old block not recognised)")
+    ok = false
+  end
+else
+  plainEdit("Menu button", '{ label = "INSTALLED" }', '{ label = "TASKS" }, { label = "INSTALLED" }')
+  plainEdit("Tasks tab", "local actions = {", BLOCK .. "\n\nlocal actions = {")
+  plainEdit("Button action", "actInstalled, actCredits }", "actTasks, actInstalled, actCredits }")
+  -- list this patch on the INSTALLED tab (optional)
   local s, t = src:find('{ "installed_patch",%s+"this tab",%s+function%(h%) return h%("local function " %.%. "actInstalled"%) end },')
   if s then
     src = src:sub(1, t) .. '\n    { "tasks_patch",          "offload tasks",      function(h) return h("-- tasks tab " .. "(offload)") end },' .. src:sub(t + 1)
@@ -786,6 +947,12 @@ do
   else
     print("skipped : Installed list (not found, optional)")
   end
+end
+
+-- pages must pass typed characters on (needed by the file picker)
+if not hasChar then
+  plainEdit("Typing in pages", 'elseif e == "timer" and ev[2] == timer then\n      timer = os.startTimer(1)',
+    'elseif e == "char" then\n      if onEvent then r = onEvent("char", ev[2]) end\n    elseif e == "timer" and ev[2] == timer then\n      timer = os.startTimer(1)')
 end
 
 if not ok then
@@ -799,4 +966,4 @@ local o = fs.open(path, "w")
 o.write(src)
 o.close()
 print("Done. Backup: " .. path .. ".bak")
-print("Next: put worker.lua on the other computers (see the notes at the top of tasks_patch).")
+print("Next: put worker.lua on the other computers, run  worker key <secret>  and  worker  there.")
