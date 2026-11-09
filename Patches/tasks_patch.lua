@@ -32,8 +32,9 @@
 --  GitHub, the picker falls back to the apps folders on this computer and
 --  floppies, and those files are sent to the worker as code instead.
 --  (An app that starts itself when run from a shell, like ae2Dashboard,
---  keeps running on the worker until you cancel it or it hits the worker's
---  10 minute limit.)
+--  keeps running on the worker until you cancel it with X - workers have no
+--  time limit unless you set CONFIG.maxRuntime in worker.lua. Tasks run one
+--  at a time per worker, so give a never-ending app its own computer.)
 --
 --  Autocomplete
 --    Command prompt   Tab completes program names and earlier commands;
